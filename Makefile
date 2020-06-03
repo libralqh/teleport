@@ -191,7 +191,7 @@ run-docs:
 	$(MAKE) -C build.assets run-docs
 
 #
-# tests everything: called by Jenkins
+# tests everything: called by CI
 #
 .PHONY: test
 test: ensure-webassets
@@ -204,7 +204,7 @@ test: $(VERSRC)
 # Integration tests. Need a TTY to work.
 #
 .PHONY: integration
-integration: FLAGS ?= -v -race
+integration: FLAGS ?= -cover
 integration:
 	@echo KUBECONFIG is: $(KUBECONFIG), TEST_KUBE: $(TEST_KUBE)
 	go test -tags "$(PAM_TAG) $(FIPS_TAG) $(BPF_TAG)" ./integration/... $(FLAGS)
