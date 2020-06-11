@@ -138,6 +138,11 @@ type InitConfig struct {
 
 	// CipherSuites is a list of ciphersuites that the auth server supports.
 	CipherSuites []uint16
+
+	// CASigningAlg is a signing algorithm used for SSH (certificate and
+	// handshake) signatures for both host and user CAs. This option only
+	// affects newly-created CAs.
+	CASigningAlg string
 }
 
 // Init instantiates and configures an instance of AuthServer
@@ -325,6 +330,7 @@ func Init(cfg InitConfig, opts ...AuthServerOption) (*AuthServer, error) {
 				ClusterName:  cfg.ClusterName.GetClusterName(),
 				Type:         services.UserCA,
 				SigningKeys:  [][]byte{priv},
+				SigningAlg:   services.ParseSigningAlg(cfg.CASigningAlg),
 				CheckingKeys: [][]byte{pub},
 				TLSKeyPairs:  []services.TLSKeyPair{{Cert: certPEM, Key: keyPEM}},
 			},
@@ -379,6 +385,7 @@ func Init(cfg InitConfig, opts ...AuthServerOption) (*AuthServer, error) {
 				ClusterName:  cfg.ClusterName.GetClusterName(),
 				Type:         services.HostCA,
 				SigningKeys:  [][]byte{priv},
+				SigningAlg:   services.ParseSigningAlg(cfg.CASigningAlg),
 				CheckingKeys: [][]byte{pub},
 				TLSKeyPairs:  []services.TLSKeyPair{{Cert: certPEM, Key: keyPEM}},
 			},
