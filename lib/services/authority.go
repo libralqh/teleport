@@ -195,8 +195,6 @@ type CertAuthority interface {
 	GetCheckingKeys() [][]byte
 	// GetSigningKeys returns signing keys
 	GetSigningKeys() [][]byte
-	//GetSigningAlg returns the signing algorithm used by signing keys.
-	GetSigningAlg() string
 	// CombinedMapping is used to specify combined mapping from legacy property Roles
 	// and new property RoleMap
 	CombinedMapping() RoleMap
@@ -241,6 +239,10 @@ type CertAuthority interface {
 	GetRotation() Rotation
 	// SetRotation sets rotation state.
 	SetRotation(Rotation)
+	// GetSigningAlg returns the signing algorithm used by signing keys.
+	GetSigningAlg() string
+	// SetSigningAlg sets the signing algorithm used by signing keys.
+	SetSigningAlg(string)
 	// Clone returns a copy of the cert authority object.
 	Clone() CertAuthority
 }
@@ -608,6 +610,10 @@ func (ca *CertAuthorityV2) GetSigningAlg() string {
 	}
 }
 
+func (ca *CertAuthorityV2) SetSigningAlg(alg string) {
+	ca.Spec.SigningAlg = ParseSigningAlg(alg)
+}
+
 // Check checks if all passed parameters are valid
 func (ca *CertAuthorityV2) Check() error {
 	err := ca.ID().Check()
@@ -874,6 +880,7 @@ const CertAuthoritySpecV2Schema = `{
         }
       }
     },
+    "signing_alg": {"type": "integer"},
     "rotation": %v,
     "role_map": %v
   }
