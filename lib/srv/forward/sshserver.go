@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
@@ -782,7 +783,7 @@ func (s *Server) handleSessionRequests(ctx context.Context, ch ssh.Channel, in <
 				scx.Debugf("Client %v disconnected", s.sconn.RemoteAddr())
 				return
 			}
-			if err := s.dispatch(ch, req, scx); err != nil {
+			if err := s.dispatch(ctx, ch, req, scx); err != nil {
 				s.replyError(ch, req, err)
 				return
 			}
@@ -808,27 +809,29 @@ func (s *Server) handleSessionRequests(ctx context.Context, ch ssh.Channel, in <
 	}
 }
 
-func (s *Server) dispatch(ch ssh.Channel, req *ssh.Request, ctx *srv.ServerContext) error {
-	ctx.Debugf("Handling request %v, want reply %v.", req.Type, req.WantReply)
+func (s *Server) dispatch(ctx context.Context, ch ssh.Channel, req *ssh.Request, scx *srv.ServerContext) error {
+	scx.Debugf("Handling request %v, want reply %v.", req.Type, req.WantReply)
 
 	switch req.Type {
 	case sshutils.ExecRequest:
-		return s.termHandlers.HandleExec(ch, req, ctx)
+		return s.termHandlers.HandleExec(ch, req, scx)
 	case sshutils.PTYRequest:
-		return s.termHandlers.HandlePTYReq(ch, req, ctx)
+		return s.termHandlers.HandlePTYReq(ch, req, scx)
 	case sshutils.ShellRequest:
-		return s.termHandlers.HandleShell(ch, req, ctx)
+		return s.termHandlers.HandleShell(ch, req, scx)
 	case sshutils.WindowChangeRequest:
-		return s.termHandlers.HandleWinChange(ch, req, ctx)
+		return s.termHandlers.HandleWinChange(ch, req, scx)
 	case sshutils.EnvRequest:
-		return s.handleEnv(ch, req, ctx)
+		return s.handleEnv(ch, req, scx)
 	case sshutils.SubsystemRequest:
-		return s.handleSubsystem(ch, req, ctx)
+		return s.handleSubsystem(ch, req, scx)
+	case sshutils.X11ForwardRequest:
+		return s.handleX11Forward(ctx, ch, req, scx)
 	case sshutils.AgentForwardRequest:
 		// to maintain interoperability with OpenSSH, agent forwarding requests
 		// should never fail, all errors should be logged and we should continue
 		// processing requests.
-		err := s.handleAgentForward(ch, req, ctx)
+		err := s.handleAgentForward(ch, req, scx)
 		if err != nil {
 			s.log.Debug(err)
 		}
@@ -859,6 +862,182 @@ func (s *Server) handleAgentForward(ch ssh.Channel, req *ssh.Request, ctx *srv.S
 	}
 
 	return nil
+}
+
+// handleX11ChannelRequest accepts an X11 channel and forwards it back to the client.
+// Servers which support X11 forwarding request a separate channel for serving each
+// inbound connection on the X11 socket of the remote session.
+func (s *Server) handleX11ChannelRequest(ctx context.Context, xreq ssh.NewChannel) error {
+	// accept inbound X11 channel from server
+	sch, sin, err := xreq.Accept()
+	if err != nil {
+		return trace.Wrap(err)
+	}
+	// setup outbound X11 channel to client
+	cch, cin, err := s.sconn.OpenChannel(sshutils.X11ChannelRequest, xreq.ExtraData())
+	if err != nil {
+		sch.Close()
+		return trace.Wrap(err)
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	// scw and ccw protect CloseWrite calls against sch and cch respectively.
+	var scw, ccw sync.Once
+
+	// ioflag is used by the two io goroutines to determine if they are the
+	// first or second goroutine to complete.  The second goroutine to complete
+	// ensures that the main request forwarding goroutine also terminates by
+	// cancelling its context.
+	var ioflag uint32
+
+	defer func() {
+		// consume our sync.Once instances if they haven't been
+		// consumed already (prevents CloseWrite calls from racing
+		// with Close calls).
+		scw.Do(func() {})
+		ccw.Do(func() {})
+		cancel()
+		sch.Close()
+		cch.Close()
+	}()
+
+	go func() {
+		// forward data from server to client
+		io.Copy(cch, sch)
+		// inform client that no more data is coming
+		ccw.Do(func() {
+			cch.CloseWrite()
+		})
+		// if we are the second io forwarder to complete,
+		// then signal shutdown to main goroutine.
+		if atomic.SwapUint32(&ioflag, 1) > 0 {
+			cancel()
+		}
+	}()
+
+	go func() {
+		// forward data from client to server
+		io.Copy(sch, cch)
+		// inform server that no more data is coming
+		scw.Do(func() {
+			sch.CloseWrite()
+		})
+		// if we are the second io forwarder to complete,
+		// then signal shutdown to main goroutine.
+		if atomic.SwapUint32(&ioflag, 1) > 0 {
+			cancel()
+		}
+	}()
+
+	// multiplex requests until channel is closed or both
+	// io forwarders have completed.
+	for {
+		select {
+		case sreq := <-sin:
+			if sreq == nil {
+				return nil
+			}
+			switch sreq.Type {
+			case sshutils.WindowChangeRequest:
+				if _, err := forwardRequest(cch, sreq); err != nil {
+					return trace.Wrap(err)
+				}
+			default:
+				s.log.Errorf("Unsupported X11 channel request type: %s", sreq.Type)
+				if sreq.WantReply {
+					sreq.Reply(false, nil)
+				}
+				continue
+			}
+		case creq := <-cin:
+			if creq == nil {
+				return nil
+			}
+			switch creq.Type {
+			case sshutils.WindowChangeRequest:
+				if _, err := forwardRequest(sch, creq); err != nil {
+					return trace.Wrap(err)
+				}
+			default:
+				s.log.Errorf("Unsupported X11 channel request type: %s", creq.Type)
+				if creq.WantReply {
+					creq.Reply(false, nil)
+				}
+				continue
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// serveX11Channels registers and runs a hander for X11 channel requests
+// generated by the server.  Must not be launched until X11 forwarding has
+// been requested and authorized.
+func (s *Server) serveX11Channels(ctx context.Context) error {
+	ncs := s.remoteClient.HandleChannelOpen(sshutils.X11ChannelRequest)
+	if ncs == nil {
+		return trace.AlreadyExists("x11 forwarding already active")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	for {
+		select {
+		case req := <-ncs:
+			if req == nil {
+				return nil
+			}
+			go func() {
+				if err := s.handleX11ChannelRequest(ctx, req); err != nil {
+					s.log.Errorf("X11 channel fwd failed: %v", err)
+				}
+			}()
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+// handleX11Forward handles an X11 forwarding request from the client.
+func (s *Server) handleX11Forward(ctx context.Context, ch ssh.Channel, req *ssh.Request, scx *srv.ServerContext) error {
+	if !scx.Identity.RoleSet.PermitX11Forwarding() {
+		s.replyError(ch, req, trace.AccessDenied("X11 forwarding not permitted"))
+		return nil
+	}
+	ok, err := forwardRequest(scx.RemoteSession, req)
+	if err != nil || !ok {
+		return trace.Wrap(err)
+	}
+	go func() {
+		if err := s.serveX11Channels(ctx); err != nil {
+			s.log.Errorf("X11 channel srv failed: %v", err)
+		}
+	}()
+
+	// Emit a x11 forwarding audit event.
+	s.EmitAuditEvent(events.X11Forward, events.EventFields{
+		events.EventLogin: s.identityContext.Login,
+		events.EventUser:  s.identityContext.TeleportUser,
+		events.LocalAddr:  s.sconn.LocalAddr().String(),
+		events.RemoteAddr: s.sconn.RemoteAddr().String(),
+	})
+	return nil
+}
+
+// sendRequest represents a resource capable of sending an ssh request such as
+// an ssh.Channel or ssh.Session.
+type sendRequest interface {
+	SendRequest(name string, wantReply bool, payload []byte) (bool, error)
+}
+
+// forwardRequest is a helper for forwarding a request across a session or channel.
+func forwardRequest(sender sendRequest, req *ssh.Request) (bool, error) {
+	reply, err := sender.SendRequest(req.Type, req.WantReply, req.Payload)
+	if err != nil || !req.WantReply {
+		return reply, trace.Wrap(err)
+	}
+	return reply, trace.Wrap(req.Reply(reply, nil))
 }
 
 func (s *Server) handleSubsystem(ch ssh.Channel, req *ssh.Request, ctx *srv.ServerContext) error {
